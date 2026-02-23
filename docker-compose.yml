@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   rtb-processor:
     build: .
@@ -37,8 +35,11 @@ services:
     networks:
       - rtb-network
 
+  # --------------------------------------------------------------------------
+  # ClickHouse
+  # --------------------------------------------------------------------------
   clickhouse:
-    image: clickhouse/clickhouse-server:23.8-alpine
+    image: clickhouse/clickhouse-server:26.1-alpine
     container_name: clickhouse
     ports:
       - "9000:9000"
@@ -53,8 +54,11 @@ services:
     networks:
       - rtb-network
 
+  # --------------------------------------------------------------------------
+  # RabbitMQ
+  # --------------------------------------------------------------------------
   rabbitmq:
-    image: rabbitmq:3.12-management-alpine
+    image: rabbitmq:4.2.4-management-alpine
     container_name: rabbitmq
     ports:
       - "5672:5672"
@@ -72,10 +76,25 @@ services:
     networks:
       - rtb-network
 
+  # --------------------------------------------------------------------------
+  # SFTP server (for local development / testing)
+  # --------------------------------------------------------------------------
+  sftp:
+    image: atmoz/sftp:alpine
+    container_name: sftp
+    ports:
+      - "2222:22"
+    volumes:
+      - sftp-data:/home/user/upload
+    command: "user:secret:::upload"
+    restart: unless-stopped
+
+
 volumes:
   rtb-downloads:
   clickhouse-data:
   rabbitmq-data:
+  sftp-data:
 
 networks:
   rtb-network:
