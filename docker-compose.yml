@@ -1,0 +1,82 @@
+version: "3.9"
+
+services:
+  rtb-processor:
+    build: .
+    container_name: rtb-processor
+    restart: unless-stopped
+    environment:
+      # SFTP Settings
+      SFTP_HOST: ${SFTP_HOST:-sftp-server}
+      SFTP_PORT: ${SFTP_PORT:-22}
+      SFTP_USER: ${SFTP_USER:-sftpuser}
+      SFTP_PASSWORD: ${SFTP_PASSWORD:-secret}
+      SFTP_REMOTE_DIR: ${SFTP_REMOTE_DIR:-/upload}
+      SFTP_POLL_INTERVAL_SECONDS: ${SFTP_POLL_INTERVAL_SECONDS:-30}
+      # Local Storage
+      LOCAL_DOWNLOAD_DIR: /tmp/rtb-downloads
+      # ClickHouse Settings
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
+      CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-9000}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-default}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_BATCH_SIZE: ${CLICKHOUSE_BATCH_SIZE:-1000}
+      # RabbitMQ Settings
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://guest:guest@rabbitmq:5672/}
+      RABBITMQ_QUEUE: ${RABBITMQ_QUEUE:-rtb_files}
+      # Processing
+      MAX_WORKERS: ${MAX_WORKERS:-4}
+    volumes:
+      - rtb-downloads:/tmp/rtb-downloads
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - rtb-network
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8-alpine
+    container_name: clickhouse
+    ports:
+      - "9000:9000"
+      - "8123:8123"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - rtb-network
+
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - rtb-network
+
+volumes:
+  rtb-downloads:
+  clickhouse-data:
+  rabbitmq-data:
+
+networks:
+  rtb-network:
+    driver: bridge
