@@ -29,97 +29,81 @@ func NewZipProcessor(
 	chRepo *repository.ClickHouseRepo,
 	publisher *messaging.RabbitMQPublisher,
 ) *ZipProcessor {
-	return &ZipProcessor{
-		cfg:       cfg,
-		chRepo:    chRepo,
-		publisher: publisher,
-	}
+	return &ZipProcessor{cfg: cfg, chRepo: chRepo, publisher: publisher}
 }
 
-// ProcessZipFile processes a single zip file:
-// 1. Insert record into rtb_files
-// 2. Read each JSON line from each file in the zip and batch insert into rtb_data
-// 3. Publish message to RabbitMQ
+// ProcessZipFile fully processes one zip file:
+//  1. Insert a record into rtb_files
+//  2. For every JSON-lines file inside the zip, batch-insert rows into rtb_data
+//  3. Publish a message to RabbitMQ
+//
+// The function always runs to completion — it is the caller's responsibility
+// (the Poller) to decide whether to start new work after a shutdown signal.
 func (p *ZipProcessor) ProcessZipFile(ctx context.Context, filePath string) error {
 	fileName := filepath.Base(filePath)
 	fileID := uuid.New().String()
 	startTime := time.Now()
 
-	log.Printf("[%s] Starting processing of %s", fileID, fileName)
+	log.Printf("[%s] Starting processing: %s", fileID, fileName)
 
-	// Insert into rtb_files
+	// 1. Record the file in rtb_files.
 	if err := p.chRepo.InsertFile(ctx, fileID, fileName); err != nil {
-		return fmt.Errorf("failed to insert file record: %w", err)
+		return fmt.Errorf("insert rtb_files: %w", err)
 	}
 
-	// Open the zip
+	// 2. Open the zip and process every entry.
 	reader, err := zip.OpenReader(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to open zip file: %w", err)
+		return fmt.Errorf("open zip: %w", err)
 	}
 	defer reader.Close()
 
 	totalLines := 0
-
-	// Process each file in the zip
 	for _, f := range reader.File {
 		if f.FileInfo().IsDir() {
 			continue
 		}
-
-		linesProcessed, err := p.processZipEntry(ctx, fileID, f)
+		n, err := p.processZipEntry(ctx, fileID, f)
 		if err != nil {
-			log.Printf("[%s] Error processing entry %s: %v", fileID, f.Name, err)
-			continue
+			// Log and continue — don't abort the whole zip for one bad entry.
+			log.Printf("[%s] Error in entry %s: %v", fileID, f.Name, err)
 		}
-		totalLines += linesProcessed
+		totalLines += n
 	}
 
-	// Publish to RabbitMQ
+	// 3. Publish to RabbitMQ.
 	if err := p.publisher.PublishFileProcessed(fileID); err != nil {
-		// Log but don't fail — file was processed successfully
-		log.Printf("[%s] Warning: failed to publish RabbitMQ message: %v", fileID, err)
+		// Non-fatal — the data is already in ClickHouse.
+		log.Printf("[%s] Warning: RabbitMQ publish failed: %v", fileID, err)
 	}
 
-	log.Printf("[%s] Finished processing %s: %d lines in %s",
-		fileID, fileName, totalLines, time.Since(startTime))
-
+	log.Printf("[%s] Done: %s — %d lines in %s", fileID, fileName, totalLines, time.Since(startTime))
 	return nil
 }
 
+// processZipEntry reads all JSON lines from a single entry inside the zip,
+// buffering them into batches before writing to ClickHouse.
 func (p *ZipProcessor) processZipEntry(ctx context.Context, fileID string, f *zip.File) (int, error) {
 	rc, err := f.Open()
 	if err != nil {
-		return 0, fmt.Errorf("failed to open zip entry %s: %w", f.Name, err)
+		return 0, fmt.Errorf("open zip entry %s: %w", f.Name, err)
 	}
 	defer rc.Close()
 
-	decoder := json.NewDecoder(rc)
-	_ = decoder // We use a scanner for line-by-line reading to handle multiple JSON objects per file
-
-	// Re-open for scanner (json.NewDecoder reads ahead, making it tricky for line scanning)
-	// Use bufio.Scanner for line-by-line reading, using the decoder for validation
-	rc.Close()
-	rc2, err := f.Open()
-	if err != nil {
-		return 0, fmt.Errorf("failed to re-open zip entry %s: %w", f.Name, err)
-	}
-	defer rc2.Close()
-
-	scanner := bufio.NewScanner(rc2)
-	// Increase buffer size for large JSON lines
-	const maxScannerBuffer = 10 * 1024 * 1024 // 10MB
-	scanner.Buffer(make([]byte, maxScannerBuffer), maxScannerBuffer)
+	// Use a generous scanner buffer for large JSON objects.
+	const maxLine = 10 * 1024 * 1024 // 10 MB
+	scanner := bufio.NewScanner(rc)
+	scanner.Buffer(make([]byte, maxLine), maxLine)
 
 	batch := make([]string, 0, p.cfg.ClickHouseBatchSize)
 	totalLines := 0
 
-	flushBatch := func() error {
+	flush := func() error {
 		if len(batch) == 0 {
 			return nil
 		}
 		if err := p.chRepo.InsertRtbDataBatch(ctx, fileID, batch); err != nil {
-			return fmt.Errorf("failed to insert batch: %w", err)
+			return fmt.Errorf("batch insert: %w", err)
 		}
 		batch = batch[:0]
 		return nil
@@ -130,8 +114,6 @@ func (p *ZipProcessor) processZipEntry(ctx context.Context, fileID string, f *zi
 		if line == "" {
 			continue
 		}
-
-		// Validate JSON
 		if !json.Valid([]byte(line)) {
 			log.Printf("[%s] Skipping invalid JSON line in %s", fileID, f.Name)
 			continue
@@ -141,18 +123,9 @@ func (p *ZipProcessor) processZipEntry(ctx context.Context, fileID string, f *zi
 		totalLines++
 
 		if len(batch) >= p.cfg.ClickHouseBatchSize {
-			if err := flushBatch(); err != nil {
+			if err := flush(); err != nil {
 				return totalLines, err
 			}
-		}
-
-		// Check for context cancellation
-		select {
-		case <-ctx.Done():
-			// Flush remaining and return
-			_ = flushBatch()
-			return totalLines, ctx.Err()
-		default:
 		}
 	}
 
@@ -160,10 +133,5 @@ func (p *ZipProcessor) processZipEntry(ctx context.Context, fileID string, f *zi
 		return totalLines, fmt.Errorf("scanner error in %s: %w", f.Name, err)
 	}
 
-	// Flush remaining
-	if err := flushBatch(); err != nil {
-		return totalLines, err
-	}
-
-	return totalLines, nil
+	return totalLines, flush()
 }

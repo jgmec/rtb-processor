@@ -18,57 +18,55 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("Starting RTB Processor...")
 
-	// Load configuration
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
+		log.Fatalf("Failed to load config: %v", err)
 	}
-	log.Printf("Configuration loaded. MaxWorkers=%d, BatchSize=%d", cfg.MaxWorkers, cfg.ClickHouseBatchSize)
+	log.Printf("Config loaded — MaxWorkers=%d, BatchSize=%d, PollInterval=%ds",
+		cfg.MaxWorkers, cfg.ClickHouseBatchSize, cfg.SFTPPollIntervalSeconds)
 
-	// Setup ClickHouse
 	chRepo, err := repository.NewClickHouseRepo(cfg)
 	if err != nil {
-		log.Fatalf("Failed to connect to ClickHouse: %v", err)
+		log.Fatalf("ClickHouse: %v", err)
 	}
 	defer chRepo.Close()
-	log.Println("ClickHouse connected")
 
-	// Setup RabbitMQ
 	publisher, err := messaging.NewRabbitMQPublisher(cfg)
 	if err != nil {
-		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
+		log.Fatalf("RabbitMQ: %v", err)
 	}
 	defer publisher.Close()
-	log.Println("RabbitMQ connected")
 
-	// Setup SFTP client
 	sftp := sftpclient.NewClient(cfg)
 	defer sftp.Close()
 
-	// Setup processors
 	zipProc := processor.NewZipProcessor(cfg, chRepo, publisher)
 	poller := processor.NewPoller(cfg, sftp, zipProc)
 
-	// Graceful shutdown context
+	// ── Graceful shutdown ────────────────────────────────────────────────────
+	// ctx is passed to poller.Run(). When cancelled, the poller stops accepting
+	// new files but lets every already-running worker finish completely.
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
-	// Handle signals
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
 		sig := <-sigCh
-		log.Printf("Received signal %s, initiating graceful shutdown...", sig)
-		cancel()
-		// Wait for a second signal to force quit
+		log.Printf("Received %s — stopping new work, waiting for in-flight files...", sig)
+		cancel() // tells the poller to stop queuing new files
+
+		// A second signal forces an immediate exit (e.g. if workers are stuck).
 		sig2 := <-sigCh
-		log.Printf("Received second signal %s, forcing exit", sig2)
+		log.Printf("Received second signal %s — forcing exit", sig2)
 		os.Exit(1)
 	}()
+	// ────────────────────────────────────────────────────────────────────────
 
-	// Run the poller (blocks until context is cancelled)
+	// Blocks here until ctx is cancelled AND all in-flight workers are done.
 	poller.Run(ctx)
 
+	// defers (ClickHouse, RabbitMQ, SFTP close) run here — after all workers
+	// have finished, so connections are still valid during the last writes.
 	log.Println("RTB Processor stopped gracefully")
 }
